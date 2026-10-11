@@ -1,0 +1,6 @@
+# Keep the docker build context down to just the boot jar the Dockerfile COPYs -- the jar is
+# built on the host (./gradlew bootJar) before `docker compose build query-engine` runs, so
+# nothing else (src/, .gradle/, gradle wrapper cache, etc.) needs to go into the image.
+*
+!build/libs/*.jar
+build/libs/*-plain.jar
