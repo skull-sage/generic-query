@@ -2,7 +2,7 @@
 #
 # dry-run.sh — instantly stand up the whole stack for trying things out, either via the *.http
 # files (try_query.http, publish_query.http) or visually in the browser:
-#   1. Build the query_engine boot jar (if needed), then start a dockerized Postgres (seeded
+#   1. Build the query_engine boot jar (incremental), then start a dockerized Postgres (seeded
 #      with order_projection rows, see docker/init/01_order_projection.sql) and a dockerized
 #      query_engine together via docker compose.
 #   2. Install (if needed) and start the frontend-react dev server in the background, waiting
@@ -24,7 +24,7 @@
 #   ./dry-run.sh --db-only       # just start Postgres (for manual testing against query_engine)
 #   ./dry-run.sh --no-frontend   # start Postgres + query_engine only, skip the UI
 #   ./dry-run.sh --no-open       # start everything but don't open the browser
-#   ./dry-run.sh --rebuild       # force a fresh ./gradlew build + docker image rebuild
+#   ./dry-run.sh --rebuild       # clean ./gradlew build + docker image rebuild without cache
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -65,21 +65,26 @@ if [[ "${DB_ONLY}" -eq 1 ]]; then
   exit 0
 fi
 
-# ---- 2. build query_engine's boot jar only if it's missing or --rebuild was passed ----
-JAR="$(find "${ENGINE_DIR}/build/libs" -maxdepth 1 -name '*.jar' ! -name '*-plain.jar' 2>/dev/null | head -1)"
-if [[ "${REBUILD}" -eq 1 || -z "${JAR}" ]]; then
-  echo "==> Building query_engine ..."
-  ( cd "${ENGINE_DIR}" && chmod +x ./gradlew && ./gradlew bootJar --no-daemon -q )
+# ---- 2. build query_engine's boot jar ----
+# Always run bootJar: Gradle's up-to-date check makes this a no-op when sources haven't changed,
+# and it guarantees the jar matches the checked-out code. Skipping it whenever *a* jar existed
+# meant a `git pull` left build/libs (gitignored) holding a jar from the previous code, which
+# then got baked into the image and served instead of the pulled code.
+echo "==> Building query_engine ..."
+if [[ "${REBUILD}" -eq 1 ]]; then
+  ( cd "${ENGINE_DIR}" && chmod +x ./gradlew && ./gradlew clean bootJar --no-daemon -q )
 else
-  echo "==> Reusing existing build: ${JAR} (pass --rebuild to force a fresh build)"
+  ( cd "${ENGINE_DIR}" && chmod +x ./gradlew && ./gradlew bootJar --no-daemon -q )
 fi
 
-# ---- 3. build (if needed) and start the query_engine container ----
+# ---- 3. build and start the query_engine container ----
+# --build always rebuilds the image from the jar above (cheap, Docker layer cache) and recreates
+# the container if the image changed. Plain `up -d` would keep reusing an existing image.
 echo "==> Building/starting the query_engine container ..."
 if [[ "${REBUILD}" -eq 1 ]]; then
-  compose build query-engine
+  compose build --no-cache query-engine
 fi
-compose up -d query-engine
+compose up -d --build query-engine
 
 echo "==> Waiting for query_engine to come up on ${ENGINE_URL} ..."
 READY=0
