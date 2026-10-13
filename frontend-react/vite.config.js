@@ -9,6 +9,7 @@ export default defineConfig({
     proxy: {
       '/engine': { target: 'http://localhost:8080', changeOrigin: true },
       '/data-query': { target: 'http://localhost:8080', changeOrigin: true },
+      '/query-roles': { target: 'http://localhost:8080', changeOrigin: true },
     },
   },
 })

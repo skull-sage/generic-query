@@ -24,13 +24,15 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Mono;
 import tools.jackson.dataformat.yaml.YAMLMapper;
 
 import java.util.Set;
 
 /**
  * Phase 1 design-time endpoints from the PRD, all fixed paths under /engine. The query being
- * acted on is always identified by {@code queryName} in the request body, never in the URL.
+ * acted on is always identified by {@code queryName} in the request body, never in the URL. Every
+ * handler is reactive: it returns a {@link Mono} that resolves on the non-blocking R2DBC pipeline.
  *
  * <p>{@code /engine/draft} and {@code /engine/draft-yml} are two separate endpoints for the same
  * draft operation: the former accepts/produces JSON, the latter accepts YAML and produces JSON.
@@ -50,45 +52,50 @@ public class EngineController {
     }
 
     @PostMapping(path = "/draft", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<DraftResponse> draft(@Valid @RequestBody DraftRequest request,
-                                                @RequestHeader(value = "X-Author", defaultValue = "anonymous") String author) {
-        return ResponseEntity.ok(service.draft(request, author));
+    public Mono<ResponseEntity<DraftResponse>> draft(@Valid @RequestBody DraftRequest request,
+                                                      @RequestHeader(value = "X-Author", defaultValue = "anonymous") String author) {
+        return service.draft(request, author).map(ResponseEntity::ok);
     }
 
     @PostMapping(path = "/draft-yml", consumes = MediaType.APPLICATION_YAML_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<DraftResponse> draftYml(@RequestBody String yamlBody,
-                                                   @RequestHeader(value = "X-Author", defaultValue = "anonymous") String author) {
-        DraftRequest request = yamlMapper.readValue(yamlBody, DraftRequest.class);
-        Set<ConstraintViolation<DraftRequest>> violations = validator.validate(request);
-        if (!violations.isEmpty()) {
-            throw new ConstraintViolationException(violations);
-        }
-        return ResponseEntity.ok(service.draft(request, author));
+    public Mono<ResponseEntity<DraftResponse>> draftYml(@RequestBody String yamlBody,
+                                                        @RequestHeader(value = "X-Author", defaultValue = "anonymous") String author) {
+        return Mono.fromCallable(() -> {
+                    DraftRequest request = yamlMapper.readValue(yamlBody, DraftRequest.class);
+                    Set<ConstraintViolation<DraftRequest>> violations = validator.validate(request);
+                    if (!violations.isEmpty()) {
+                        throw new ConstraintViolationException(violations);
+                    }
+                    return request;
+                })
+                .flatMap(request -> service.draft(request, author))
+                .map(ResponseEntity::ok);
     }
 
     @PostMapping("/drafted")
-    public ResponseEntity<DraftResponse> getDrafted(@Valid @RequestBody DraftedLookupRequest request) {
-        return ResponseEntity.ok(service.getDrafted(request));
+    public Mono<ResponseEntity<DraftResponse>> getDrafted(@Valid @RequestBody DraftedLookupRequest request) {
+        return service.getDrafted(request).map(ResponseEntity::ok);
     }
 
     @PostMapping("/simulate")
-    public ResponseEntity<SimulateResponse> simulate(@Valid @RequestBody SimulateRequest request) {
-        return ResponseEntity.ok(service.simulate(request));
+    public Mono<ResponseEntity<SimulateResponse>> simulate(@Valid @RequestBody SimulateRequest request) {
+        return service.simulate(request).map(ResponseEntity::ok);
     }
 
     @PostMapping("/publish")
-    public ResponseEntity<PublishResponse> publish(@Valid @RequestBody PublishRequest request,
-                                                     @RequestHeader(value = "X-Author", defaultValue = "anonymous") String publishedBy) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(service.publish(request, publishedBy));
+    public Mono<ResponseEntity<PublishResponse>> publish(@Valid @RequestBody PublishRequest request,
+                                                         @RequestHeader(value = "X-Author", defaultValue = "anonymous") String publishedBy) {
+        return service.publish(request, publishedBy)
+                .map(response -> ResponseEntity.status(HttpStatus.CREATED).body(response));
     }
 
     @PostMapping("/discard")
-    public ResponseEntity<DiscardResponse> discard(@Valid @RequestBody DiscardRequest request) {
-        return ResponseEntity.ok(service.discard(request));
+    public Mono<ResponseEntity<DiscardResponse>> discard(@Valid @RequestBody DiscardRequest request) {
+        return service.discard(request).map(ResponseEntity::ok);
     }
 
     @PostMapping("/list")
-    public ResponseEntity<ListResponse> list(@RequestBody(required = false) ListRequest request) {
-        return ResponseEntity.ok(service.list(request));
+    public Mono<ResponseEntity<ListResponse>> list(@RequestBody(required = false) ListRequest request) {
+        return service.list(request).map(ResponseEntity::ok);
     }
 }

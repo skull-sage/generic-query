@@ -1,6 +1,8 @@
 import yaml from 'js-yaml'
 
-/** Default YAML template shown when the Query Builder opens with nothing loaded yet. */
+/** Default YAML template shown when the Query Builder opens with nothing loaded yet.
+ *  allowed_roles are intentionally not part of the draft -- they are chosen later, in the publish
+ *  dialog, from the realm roles and groups returned by GET /query-roles. */
 export const DEFAULT_DRAFT_YAML = `queryName: orders.ordersByStatusAndBranch
 sql: >
   SELECT orderId, status, total, branchId
@@ -9,14 +11,12 @@ sql: >
 params:
   status: String
   branchId: int
-allowed_roles:
-  - senior_DBA
-  - chief_DBA
 `
 
 /**
  * Parses the YAML text in the editor into the JSON body POST /engine/draft expects:
- * { queryName, sql, params, allowed_roles }.
+ * { queryName, sql, params }. allowed_roles are not declared during drafting and are therefore
+ * neither required nor validated here -- they are selected at publish time instead.
  * Throws with a readable message if the YAML is malformed or missing required fields.
  */
 export function yamlToDraftEntry(yamlText) {
@@ -27,24 +27,22 @@ export function yamlToDraftEntry(yamlText) {
     throw new Error(`Invalid YAML: ${err.message}`)
   }
   if (!parsed || typeof parsed !== 'object') {
-    throw new Error('YAML must define an object with queryName, sql, params, allowed_roles')
+    throw new Error('YAML must define an object with queryName, sql, params')
   }
-  const { queryName, sql, params, allowed_roles } = parsed
+  const { queryName, sql, params } = parsed
   if (!queryName) throw new Error('queryName is required')
   if (!sql) throw new Error('sql is required')
   return {
     queryName,
     sql,
     params: params || {},
-    allowed_roles: allowed_roles || [],
   }
 }
 
 /**
  * Reconstructs editable YAML from a ValidatedQuery descriptor (returned by draft/drafted/list),
- * for resuming a draft that compiled successfully. Loses nothing the descriptor itself carries,
- * but a draft that failed validation (status DRAFT) has no ValidatedQuery to rebuild from --
- * see QueryBuilderPage for how that case is handled.
+ * for resuming a draft that compiled successfully. allowed_roles are deliberately omitted: they
+ * are not part of the draft and are picked in the publish dialog instead.
  */
 export function validatedQueryToYaml(queryName, validatedQuery) {
   const paramsMap = {}
@@ -56,7 +54,6 @@ export function validatedQueryToYaml(queryName, validatedQuery) {
     queryName,
     sql: validatedQuery.sql,
     params: paramsMap,
-    allowed_roles: validatedQuery.allowedRoles || [],
   }
   return yaml.dump(doc, { lineWidth: -1 })
 }

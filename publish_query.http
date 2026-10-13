@@ -20,6 +20,10 @@
 @queryName = orders.ordersByStatusAndBranch
 @author = senior_dba@bracits.com
 
+### 0a. Query roles — the realm roles + groups catalog the UI offers at publish time (to choose
+### allowed_roles) and at run time (to pick a calling identity). Seeded in 02_query_engine_schema.sql.
+GET {{baseUrl}}/query-roles
+
 ### 0. Drafted (resume) — 404 DRAFT_NOT_FOUND. Non-drafted: queryName has never been drafted.
 POST {{baseUrl}}/engine/drafted
 Content-Type: application/json
@@ -36,8 +40,7 @@ X-Author: {{author}}
 {
   "queryName": "{{queryName}}",
   "sql": "SELECT orderId, status, total, branchId FROM order_projection WHERE status = :status AND branchId = :branchId",
-  "params": { "status": "String", "branchId": "int" },
-  "allowed_roles": ["senior_DBA", "chief_DBA"]
+  "params": { "status": "String", "branchId": "int" }
 }
 
 ### 1b. Draft — separate endpoint, /engine/draft-yml, body is application/yaml, response is
@@ -51,9 +54,6 @@ sql: "SELECT orderId, status, total, branchId FROM order_projection WHERE status
 params:
   status: String
   branchId: int
-allowed_roles:
-  - senior_DBA
-  - chief_DBA
 
 ### 1c. Draft with a param validation error — :branchId is used in sql but missing from
 ### params. Stored as status=DRAFT (not VALIDATED); the draft is kept even though validation failed.
@@ -64,8 +64,7 @@ X-Author: {{author}}
 {
   "queryName": "orders.orderById",
   "sql": "SELECT orderId FROM order_projection WHERE orderId = :orderId",
-  "params": {},
-  "allowed_roles": ["senior_DBA"]
+  "params": {}
 }
 
 ### 2. Drafted (resume) — drafted case. Reads back the open draft for queryName from step 1b
@@ -117,13 +116,15 @@ Content-Type: application/json
 }
 
 ### 5. Publish — 422 NOT_SIMULATED. orders.orderById was never successfully simulated
-### (see 4a), so publish is refused.
+### (see 4a), so publish is refused. allowed_roles (realm roles and/or group names from
+### /query-roles) are supplied here at publish time, not during drafting.
 POST {{baseUrl}}/engine/publish
 Content-Type: application/json
 X-Author: {{author}}
 
 {
-  "queryName": "orders.orderById"
+  "queryName": "orders.orderById",
+  "allowed_roles": ["senior_DBA"]
 }
 
 ### 6. Discard — releases the never-publishable orders.orderById draft from steps 1c/4a/5.
@@ -144,13 +145,15 @@ Content-Type: application/json
 }
 
 ### 7. Publish — happy path. queryName was simulated in step 4, so this succeeds, marks it
-### PUBLISHED (in published_query), and deletes the draft.
+### PUBLISHED (in published_query), and deletes the draft. allowed_roles mixes a realm role
+### (senior_DBA) and a group (data-platform); both are enforced by name at invoke time.
 POST {{baseUrl}}/engine/publish
 Content-Type: application/json
 X-Author: {{author}}
 
 {
-  "queryName": "{{queryName}}"
+  "queryName": "{{queryName}}",
+  "allowed_roles": ["senior_DBA", "data-platform"]
 }
 
 ### 7a. Drafted (resume) — non-drafted case: 404 DRAFT_NOT_FOUND. Publish (step 7) deleted the
@@ -173,8 +176,7 @@ X-Author: {{author}}
 {
   "queryName": "{{queryName}}",
   "sql": "SELECT orderId, status, total, branchId FROM order_projection WHERE status = :status AND branchId = :branchId",
-  "params": { "status": "String", "branchId": "int" },
-  "allowed_roles": ["senior_DBA", "chief_DBA"]
+  "params": { "status": "String", "branchId": "int" }
 }
 
 ### 8a. ... then a different author tries to draft the same queryName and gets 409 DRAFT_LOCKED
@@ -186,8 +188,7 @@ X-Author: another.dba@bracits.com
 {
   "queryName": "{{queryName}}",
   "sql": "SELECT orderId, status, total, branchId FROM order_projection WHERE status = :status AND branchId = :branchId",
-  "params": { "status": "String", "branchId": "int" },
-  "allowed_roles": ["senior_DBA", "chief_DBA"]
+  "params": { "status": "String", "branchId": "int" }
 }
 
 ### 9. Discard — releases the draft opened in step 8, back to just queryName PUBLISHED with

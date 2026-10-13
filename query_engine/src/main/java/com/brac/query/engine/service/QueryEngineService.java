@@ -19,26 +19,29 @@ import com.brac.query.engine.model.DraftStatus;
 import com.brac.query.engine.model.PublishedQuery;
 import com.brac.query.engine.model.ParamType;
 import com.brac.query.engine.model.QueryEntry;
+import com.brac.query.engine.model.ValidatedQuery;
 import com.brac.query.engine.store.DraftStore;
 import com.brac.query.engine.store.PublishedQueryRepository;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import reactor.core.publisher.Mono;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Orchestrates the query lifecycle described in the PRD: draft -> simulate -> publish/discard,
- * all addressed by {@code queryName} in the request body rather than the URL. The Draft Store
- * and Query Registry are both persisted in Postgres (see {@link DraftStore} and
- * {@link PublishedQueryRepository}) -- no in-memory map holds lifecycle state. There is no
- * versioning: drafting or publishing a queryName again simply overwrites whatever was there
- * before.
+ * all addressed by {@code queryName} in the request body rather than the URL, and all fully
+ * reactive (returning {@link Mono}) so the pipeline is non-blocking from the WebFlux controller
+ * down through R2DBC. The Draft Store and Query Registry are both persisted in Postgres (see
+ * {@link DraftStore} and {@link PublishedQueryRepository}) -- no in-memory map holds lifecycle
+ * state. There is no versioning: drafting or publishing a queryName again simply overwrites
+ * whatever was there before.
  */
 @Service
 public class QueryEngineService {
@@ -58,192 +61,227 @@ public class QueryEngineService {
         this.executor = executor;
     }
 
-    public DraftResponse draft(DraftRequest request, String author) {
-        String queryName = requireQueryName(request.queryName());
-        Instant now = Instant.now();
+    public Mono<DraftResponse> draft(DraftRequest request, String author) {
+        return Mono.defer(() -> {
+            String queryName = requireQueryName(request.queryName());
+            Instant now = Instant.now();
 
-        draftStore.find(queryName).ifPresent(existing -> {
-            if (!existing.isExpired(now) && !existing.author().equals(author)) {
-                throw new EngineException("DRAFT_LOCKED", HttpStatus.CONFLICT, queryName,
-                        "Draft for '" + queryName + "' is held by " + existing.author()
-                                + " (expires " + existing.expiresAt() + ")");
-            }
+            Mono<Void> lockCheck = draftStore.find(queryName)
+                    .flatMap(existing -> {
+                        if (!existing.isExpired(now) && !existing.author().equals(author)) {
+                            return Mono.<Void>error(new EngineException("DRAFT_LOCKED", HttpStatus.CONFLICT, queryName,
+                                    "Draft for '" + queryName + "' is held by " + existing.author()
+                                            + " (expires " + existing.expiresAt() + ")"));
+                        }
+                        return Mono.empty();
+                    });
+
+            return lockCheck.then(Mono.defer(() -> {
+                QueryEntry entry = new QueryEntry(request.sql(), request.params(), request.allowedRoles());
+                var validationResult = validator.validate(entry);
+                Instant expiresAt = now.plus(DRAFT_TTL);
+                DraftStatus status = validationResult.hasErrors() ? DraftStatus.DRAFT : DraftStatus.VALIDATED;
+
+                DraftRecord record = new DraftRecord(
+                        queryName, entry, validationResult.validatedQuery(), status,
+                        validationResult.errors(), false, author, now, expiresAt
+                );
+                return draftStore.save(record).thenReturn(new DraftResponse(
+                        queryName, status.name(), validationResult.validatedQuery(),
+                        validationResult.errors(), expiresAt));
+            }));
         });
-
-        QueryEntry entry = new QueryEntry(request.sql(), request.params(), request.allowedRoles());
-        var validationResult = validator.validate(entry);
-        Instant expiresAt = now.plus(DRAFT_TTL);
-
-        DraftStatus status = validationResult.hasErrors() ? DraftStatus.DRAFT : DraftStatus.VALIDATED;
-        DraftRecord record = new DraftRecord(
-                queryName, entry, validationResult.validatedQuery(), status,
-                validationResult.errors(), false, author, now, expiresAt
-        );
-        draftStore.save(record);
-
-        return new DraftResponse(queryName, status.name(), validationResult.validatedQuery(), validationResult.errors(), expiresAt);
     }
 
-    public DraftResponse getDrafted(DraftedLookupRequest request) {
-        String queryName = requireQueryName(request.queryName());
-        DraftRecord record = loadDraftOrThrow(queryName);
-        return new DraftResponse(record.queryName(), record.status().name(), record.validatedQuery(), record.errors(), record.expiresAt());
+    public Mono<DraftResponse> getDrafted(DraftedLookupRequest request) {
+        return Mono.defer(() -> {
+            String queryName = requireQueryName(request.queryName());
+            return loadDraftOrThrow(queryName).map(record -> new DraftResponse(
+                    record.queryName(), record.status().name(), record.validatedQuery(),
+                    record.errors(), record.expiresAt()));
+        });
     }
 
-    public SimulateResponse simulate(SimulateRequest request) {
-        String queryName = requireQueryName(request.queryName());
-        DraftRecord record = loadDraftOrThrow(queryName);
+    public Mono<SimulateResponse> simulate(SimulateRequest request) {
+        return Mono.defer(() -> {
+            String queryName = requireQueryName(request.queryName());
+            Map<String, Object> params = request.params() == null ? Map.of() : request.params();
 
-        if (record.status() == DraftStatus.DRAFT) {
-            throw new EngineException("DRAFT_INVALID", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
-                    "Draft for '" + queryName + "' has validation errors and cannot be simulated");
-        }
+            return loadDraftOrThrow(queryName).flatMap(record -> {
+                if (record.status() == DraftStatus.DRAFT) {
+                    return Mono.error(new EngineException("DRAFT_INVALID", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
+                            "Draft for '" + queryName + "' has validation errors and cannot be simulated"));
+                }
+                EngineException paramError = validateParams(queryName, record, params);
+                if (paramError != null) {
+                    return Mono.error(paramError);
+                }
 
-        Map<String, Object> params = request.params() == null ? Map.of() : request.params();
-        validateParams(queryName, record, params);
-
-        // Stand-in for: OPA policy evaluation (row/field redaction), then execution against the
-        // real Projection Store (Postgres) under the row-cap cost limiter. See PRD Phase 1 step 6.
-        var execResult = executor.execute(record.validatedQuery(), params);
-
-        Instant now = Instant.now();
-        Instant expiresAt = now.plus(DRAFT_TTL);
-        draftStore.save(record.withSimulated(now, expiresAt));
-
-        var metrics = new SimulateResponse.Metrics(
-                execResult.latencyMs(),
-                execResult.rows().size(),
-                Math.round(ThreadLocalRandom.current().nextDouble(1, 50) * 100) / 100.0
-        );
-
-        return new SimulateResponse(queryName, execResult.rows(), execResult.rows().size(),
-                execResult.truncated(), metrics, List.of(), expiresAt);
+                // Stand-in for: OPA policy evaluation (row/field redaction), then execution against
+                // the real Projection Store (Postgres) under the row-cap cost limiter.
+                return executor.execute(record.validatedQuery(), params).flatMap(execResult -> {
+                    Instant now = Instant.now();
+                    Instant expiresAt = now.plus(DRAFT_TTL);
+                    var metrics = new SimulateResponse.Metrics(
+                            execResult.latencyMs(),
+                            execResult.rows().size(),
+                            Math.round(ThreadLocalRandom.current().nextDouble(1, 50) * 100) / 100.0
+                    );
+                    SimulateResponse response = new SimulateResponse(queryName, execResult.rows(),
+                            execResult.rows().size(), execResult.truncated(), metrics, List.of(), expiresAt);
+                    return draftStore.save(record.withSimulated(now, expiresAt)).thenReturn(response);
+                });
+            });
+        });
     }
 
-    public PublishResponse publish(PublishRequest request, String publishedBy) {
-        String queryName = requireQueryName(request.queryName());
-        DraftRecord record = loadDraftOrThrow(queryName);
+    @Transactional
+    public Mono<PublishResponse> publish(PublishRequest request, String publishedBy) {
+        return Mono.defer(() -> {
+            String queryName = requireQueryName(request.queryName());
 
-        if (!record.simulated()) {
-            throw new EngineException("NOT_SIMULATED", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
-                    "Draft for '" + queryName + "' has not been simulated; publish requires a fresh simulate first");
-        }
-        if (record.validatedQuery() == null) {
-            throw new EngineException("DRAFT_INVALID", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
-                    "Draft for '" + queryName + "' has no validated descriptor");
-        }
+            return loadDraftOrThrow(queryName).flatMap(record -> {
+                if (!record.simulated()) {
+                    return Mono.error(new EngineException("NOT_SIMULATED", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
+                            "Draft for '" + queryName + "' has not been simulated; publish requires a fresh simulate first"));
+                }
+                if (record.validatedQuery() == null) {
+                    return Mono.error(new EngineException("DRAFT_INVALID", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
+                            "Draft for '" + queryName + "' has no validated descriptor"));
+                }
 
-        Instant now = Instant.now();
-        PublishedQuery published = new PublishedQuery(queryName,
-                record.entry(), record.validatedQuery(), now, publishedBy);
-        publishedQueries.publish(published);
-        draftStore.delete(queryName);
+                // allowed_roles are chosen at publish time (realm roles and/or groups from the
+                // publish dialog), not during drafting. They override whatever the draft carried
+                // and become the RBAC gate enforced in invoke().
+                List<String> allowedRoles = request.allowedRoles() == null ? List.of() : request.allowedRoles().stream()
+                        .map(r -> r == null ? null : r.trim())
+                        .filter(r -> r != null && !r.isEmpty())
+                        .distinct()
+                        .toList();
+                if (allowedRoles.isEmpty()) {
+                    return Mono.error(new EngineException("NO_ALLOWED_ROLES", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
+                            "At least one allowed role or group must be selected to publish '" + queryName + "'"));
+                }
 
-        return new PublishResponse(queryName, "PUBLISHED", now, publishedBy);
+                QueryEntry publishedEntry = new QueryEntry(
+                        record.entry().sql(), record.entry().params(), allowedRoles);
+                ValidatedQuery publishedValidated = new ValidatedQuery(
+                        record.validatedQuery().sql(), record.validatedQuery().params(), allowedRoles);
+
+                Instant now = Instant.now();
+                PublishedQuery published = new PublishedQuery(queryName, publishedEntry, publishedValidated, now, publishedBy);
+
+                return publishedQueries.publish(published)
+                        .then(draftStore.delete(queryName))
+                        .thenReturn(new PublishResponse(queryName, "PUBLISHED", now, publishedBy));
+            });
+        });
     }
 
-    public DiscardResponse discard(DiscardRequest request) {
-        String queryName = requireQueryName(request.queryName());
-        loadDraftOrThrow(queryName);
-        draftStore.delete(queryName);
-        return new DiscardResponse(queryName, "DISCARDED");
+    public Mono<DiscardResponse> discard(DiscardRequest request) {
+        return Mono.defer(() -> {
+            String queryName = requireQueryName(request.queryName());
+            return loadDraftOrThrow(queryName)
+                    .flatMap(record -> draftStore.delete(queryName)
+                            .thenReturn(new DiscardResponse(queryName, "DISCARDED")));
+        });
     }
 
-    public ListResponse list(ListRequest request) {
-        ListRequest.Filter filter = request == null ? null : request.filter();
-        Instant now = Instant.now();
+    public Mono<ListResponse> list(ListRequest request) {
+        return Mono.defer(() -> {
+            ListRequest.Filter filter = request == null ? null : request.filter();
+            Instant now = Instant.now();
 
-        Map<String, PublishedQuery> publishedByName = new HashMap<>();
-        publishedQueries.findAll().forEach(pq -> publishedByName.put(pq.queryName(), pq));
+            Mono<Map<String, PublishedQuery>> publishedMono =
+                    publishedQueries.findAll().collectMap(PublishedQuery::queryName);
+            Mono<Map<String, DraftRecord>> draftMono =
+                    draftStore.findAllNotExpired(now).collectMap(DraftRecord::queryName);
 
-        Map<String, DraftRecord> draftByName = new HashMap<>();
-        draftStore.findAllNotExpired(now).forEach(d -> draftByName.put(d.queryName(), d));
+            return Mono.zip(publishedMono, draftMono).map(tuple -> {
+                Map<String, PublishedQuery> publishedByName = tuple.getT1();
+                Map<String, DraftRecord> draftByName = tuple.getT2();
 
-        java.util.Set<String> allNames = new java.util.TreeSet<>();
-        allNames.addAll(publishedByName.keySet());
-        allNames.addAll(draftByName.keySet());
+                java.util.Set<String> allNames = new java.util.TreeSet<>();
+                allNames.addAll(publishedByName.keySet());
+                allNames.addAll(draftByName.keySet());
 
-        List<ListResponse.Item> items = new ArrayList<>();
-        for (String name : allNames) {
-            PublishedQuery published = publishedByName.get(name);
-            DraftRecord draft = draftByName.get(name);
+                List<ListResponse.Item> items = new ArrayList<>();
+                for (String name : allNames) {
+                    PublishedQuery published = publishedByName.get(name);
+                    DraftRecord draft = draftByName.get(name);
 
-            if (!matchesFilter(name, published, draft, filter)) {
-                continue;
-            }
+                    if (!matchesFilter(name, published, draft, filter)) {
+                        continue;
+                    }
 
-            ListResponse.PublishedSummary publishedSummary = published == null ? null : new ListResponse.PublishedSummary(
-                    published.validatedQuery().sql(), published.validatedQuery().params(),
-                    published.validatedQuery().allowedRoles(), published.publishedAt(), published.publishedBy()
-            );
-            ListResponse.DraftSummary draftSummary = draft == null ? null : new ListResponse.DraftSummary(
-                    draft.status().name(), draft.simulated(), draft.author(), draft.updatedAt(), draft.expiresAt()
-            );
-            items.add(new ListResponse.Item(name, publishedSummary, draftSummary));
-        }
+                    ListResponse.PublishedSummary publishedSummary = published == null ? null : new ListResponse.PublishedSummary(
+                            published.validatedQuery().sql(), published.validatedQuery().params(),
+                            published.validatedQuery().allowedRoles(), published.publishedAt(), published.publishedBy()
+                    );
+                    ListResponse.DraftSummary draftSummary = draft == null ? null : new ListResponse.DraftSummary(
+                            draft.status().name(), draft.simulated(), draft.author(), draft.updatedAt(), draft.expiresAt()
+                    );
+                    items.add(new ListResponse.Item(name, publishedSummary, draftSummary));
+                }
 
-        int pageSize = (request != null && request.page() != null && request.page().size() != null)
-                ? Math.min(request.page().size(), 200) : 50;
-        List<ListResponse.Item> page = items.size() > pageSize ? items.subList(0, pageSize) : items;
-        String nextCursor = items.size() > pageSize ? page.get(page.size() - 1).queryName() : null;
+                int pageSize = (request != null && request.page() != null && request.page().size() != null)
+                        ? Math.min(request.page().size(), 200) : 50;
+                List<ListResponse.Item> page = items.size() > pageSize ? items.subList(0, pageSize) : items;
+                String nextCursor = items.size() > pageSize ? page.get(page.size() - 1).queryName() : null;
 
-        return new ListResponse(page, nextCursor);
+                return new ListResponse(page, nextCursor);
+            });
+        });
     }
 
     /**
      * Runtime invocation (Phase 2): resolves the published query, applies the operation-level
-     * RBAC gate, validates params, and executes against the projection store.
+     * RBAC gate, validates params, and executes against the projection store -- all reactive.
      */
-    public InvocationResult invoke(String name, Map<String, Object> params, List<String> callerRoles) {
-        String queryName = resolveQueryName(name);
-        PublishedQuery published = publishedQueries.find(queryName)
-                .orElseThrow(() -> new EngineException("QUERY_NOT_FOUND", HttpStatus.NOT_FOUND, queryName,
-                        "No published query named '" + queryName + "'"));
+    public Mono<InvocationResult> invoke(String name, Map<String, Object> params, List<String> callerRoles) {
+        return resolveQueryName(name).flatMap(queryName -> publishedQueries.find(queryName)
+                .switchIfEmpty(Mono.error(new EngineException("QUERY_NOT_FOUND", HttpStatus.NOT_FOUND, queryName,
+                        "No published query named '" + queryName + "'")))
+                .flatMap(published -> {
+                    List<String> allowedRoles = published.validatedQuery().allowedRoles();
+                    boolean permitted = callerRoles.stream().anyMatch(allowedRoles::contains);
+                    if (!permitted) {
+                        return Mono.error(new EngineException("FORBIDDEN", HttpStatus.FORBIDDEN, queryName,
+                                "Role(s) " + callerRoles + " not permitted to invoke '" + queryName + "'"));
+                    }
 
-        List<String> allowedRoles = published.validatedQuery().allowedRoles();
-        boolean permitted = callerRoles.stream().anyMatch(allowedRoles::contains);
-        if (!permitted) {
-            throw new EngineException("FORBIDDEN", HttpStatus.FORBIDDEN, queryName,
-                    "Role(s) " + callerRoles + " not permitted to invoke '" + queryName + "'");
-        }
+                    EngineException paramError = validateInvokeParams(queryName, published.validatedQuery(), params);
+                    if (paramError != null) {
+                        return Mono.error(paramError);
+                    }
 
-        for (var paramSpec : published.validatedQuery().params()) {
-            if (!params.containsKey(paramSpec.name())) {
-                throw new EngineException("INVALID_ARGUMENT", HttpStatus.BAD_REQUEST, queryName,
-                        "Missing required param '" + paramSpec.name() + "'");
-            }
-            Object value = params.get(paramSpec.name());
-            if (!typeMatches(paramSpec.type(), value)) {
-                throw new EngineException("INVALID_ARGUMENT", HttpStatus.BAD_REQUEST, queryName,
-                        paramSpec.name() + " expected " + paramSpec.type() + ", received "
-                                + (value == null ? "null" : value.getClass().getSimpleName()));
-            }
-        }
-
-        var execResult = executor.execute(published.validatedQuery(), params);
-        return new InvocationResult(queryName, execResult.rows());
+                    return executor.execute(published.validatedQuery(), params)
+                            .map(execResult -> new InvocationResult(queryName, execResult.rows()));
+                }));
     }
 
     public record InvocationResult(String queryName, List<Map<String, Object>> rows) {
     }
 
     /** Accepts either a bare name ("orderById") or a fully namespaced one ("orders.orderById"). */
-    private String resolveQueryName(String name) {
+    private Mono<String> resolveQueryName(String name) {
         if (name == null || name.isBlank()) {
-            throw new EngineException("QUERY_NOT_FOUND", HttpStatus.NOT_FOUND, name, "name is required");
+            return Mono.error(new EngineException("QUERY_NOT_FOUND", HttpStatus.NOT_FOUND, name, "name is required"));
         }
         if (name.contains(".")) {
-            return name;
+            return Mono.just(name);
         }
-        List<String> matches = publishedQueries.allQueryNames().stream()
+        return publishedQueries.allQueryNames()
                 .filter(qn -> qn.endsWith("." + name))
-                .toList();
-        if (matches.size() == 1) {
-            return matches.get(0);
-        }
-        throw new EngineException("QUERY_NOT_FOUND", HttpStatus.NOT_FOUND, name,
-                matches.isEmpty() ? "No published query named '" + name + "'"
-                        : "Ambiguous name '" + name + "' matches multiple queries: " + matches);
+                .collectList()
+                .flatMap(matches -> {
+                    if (matches.size() == 1) {
+                        return Mono.just(matches.get(0));
+                    }
+                    return Mono.error(new EngineException("QUERY_NOT_FOUND", HttpStatus.NOT_FOUND, name,
+                            matches.isEmpty() ? "No published query named '" + name + "'"
+                                    : "Ambiguous name '" + name + "' matches multiple queries: " + matches));
+                });
     }
 
     // --- helpers -----------------------------------------------------------------------------
@@ -274,22 +312,32 @@ public class QueryEngineService {
         return true;
     }
 
-    private void validateParams(String queryName, DraftRecord record, Map<String, Object> params) {
+    /** Returns an EngineException describing the first param problem, or null if params are valid. */
+    private EngineException validateParams(String queryName, DraftRecord record, Map<String, Object> params) {
         if (record.validatedQuery() == null) {
-            return;
+            return null;
         }
-        for (var paramSpec : record.validatedQuery().params()) {
+        return checkParams(queryName, record.validatedQuery(), params);
+    }
+
+    private EngineException validateInvokeParams(String queryName, ValidatedQuery validatedQuery, Map<String, Object> params) {
+        return checkParams(queryName, validatedQuery, params);
+    }
+
+    private EngineException checkParams(String queryName, ValidatedQuery validatedQuery, Map<String, Object> params) {
+        for (var paramSpec : validatedQuery.params()) {
             if (!params.containsKey(paramSpec.name())) {
-                throw new EngineException("INVALID_ARGUMENT", HttpStatus.BAD_REQUEST, queryName,
+                return new EngineException("INVALID_ARGUMENT", HttpStatus.BAD_REQUEST, queryName,
                         "Missing required param '" + paramSpec.name() + "'");
             }
             Object value = params.get(paramSpec.name());
             if (!typeMatches(paramSpec.type(), value)) {
-                throw new EngineException("INVALID_ARGUMENT", HttpStatus.BAD_REQUEST, queryName,
+                return new EngineException("INVALID_ARGUMENT", HttpStatus.BAD_REQUEST, queryName,
                         paramSpec.name() + " expected " + paramSpec.type() + ", received "
                                 + (value == null ? "null" : value.getClass().getSimpleName()));
             }
         }
+        return null;
     }
 
     private boolean typeMatches(ParamType type, Object value) {
@@ -306,11 +354,11 @@ public class QueryEngineService {
         };
     }
 
-    private DraftRecord loadDraftOrThrow(String queryName) {
+    private Mono<DraftRecord> loadDraftOrThrow(String queryName) {
         return draftStore.find(queryName)
                 .filter(d -> !d.isExpired(Instant.now()))
-                .orElseThrow(() -> new EngineException("DRAFT_NOT_FOUND", HttpStatus.NOT_FOUND, queryName,
-                        "No open draft for '" + queryName + "' (never drafted, published, discarded, or expired)"));
+                .switchIfEmpty(Mono.error(new EngineException("DRAFT_NOT_FOUND", HttpStatus.NOT_FOUND, queryName,
+                        "No open draft for '" + queryName + "' (never drafted, published, discarded, or expired)")));
     }
 
     private String requireQueryName(String queryName) {

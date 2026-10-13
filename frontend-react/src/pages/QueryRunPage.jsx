@@ -7,10 +7,7 @@ import StatusBadge from '../components/StatusBadge.jsx'
 import ParamsForm from '../components/ParamsForm.jsx'
 import ResultsTable from '../components/ResultsTable.jsx'
 import { invokeQuery, listQueries } from '../api/engineClient.js'
-
-// Stand-in for a real auth stack: the caller types in the role(s) they want to invoke as,
-// the same manual X-Roles convention try_query.http already exercises.
-const DEFAULT_ROLES = 'senior_DBA'
+import { useQueryRoles } from '../hooks/useQueryRoles.js'
 
 export default function QueryRunPage() {
   const { queryName: routeQueryName } = useParams()
@@ -21,8 +18,10 @@ export default function QueryRunPage() {
   const [listError, setListError] = useState(null)
 
   const [selectedName, setSelectedName] = useState(routeQueryName || '')
-  const [rolesInput, setRolesInput] = useState(DEFAULT_ROLES)
+  const [selectedRole, setSelectedRole] = useState('')
   const [paramValues, setParamValues] = useState({})
+
+  const { realmRoles, groups, loading: loadingRoles, error: rolesError } = useQueryRoles()
 
   const [result, setResult] = useState(null)
   const [runError, setRunError] = useState(null)
@@ -71,16 +70,11 @@ export default function QueryRunPage() {
   }
 
   async function handleRun() {
-    if (!selected) return
+    if (!selected || !selectedRole) return
     setRunning(true)
     setRunError(null)
     try {
-      const roles = rolesInput
-        .split(',')
-        .map((r) => r.trim())
-        .filter((r) => r.length > 0)
-        .join(',')
-      const rows = await invokeQuery(selected.queryName, paramValues, roles)
+      const rows = await invokeQuery(selected.queryName, paramValues, selectedRole)
       setResult(rows)
     } catch (err) {
       setRunError(err)
@@ -135,18 +129,38 @@ export default function QueryRunPage() {
       {selected && (
         <Panel
           title="2. Call as"
-          description="Stand-in for real auth: comma-separated role(s) sent as the X-Roles header."
+          description="Pick the realm role or group to invoke as; it's sent as the X-Roles header."
         >
-          <label className="block max-w-sm">
-            <span className="block text-xs font-medium text-slate-700 mb-1">Roles</span>
-            <input
-              type="text"
-              value={rolesInput}
-              onChange={(e) => setRolesInput(e.target.value)}
-              placeholder="e.g. senior_DBA, chief_DBA"
-              className="block w-full rounded-md border-0 py-1.5 px-3 text-sm text-slate-900 ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-inset focus:ring-indigo-600"
-            />
-          </label>
+          {rolesError ? (
+            <Alert variant="error" title="Could not load roles">{rolesError}</Alert>
+          ) : loadingRoles ? (
+            <p className="text-sm text-slate-500">Loading roles…</p>
+          ) : (
+            <label className="block max-w-sm">
+              <span className="block text-xs font-medium text-slate-700 mb-1">Identity</span>
+              <select
+                value={selectedRole}
+                onChange={(e) => setSelectedRole(e.target.value)}
+                className="block w-full rounded-md border-0 py-1.5 px-3 text-sm text-slate-900 ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-inset focus:ring-indigo-600"
+              >
+                <option value="">Select a role or group…</option>
+                <optgroup label="Realm roles">
+                  {realmRoles.map((r) => (
+                    <option key={`role:${r.name}`} value={r.name}>
+                      {r.name}
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="Groups">
+                  {groups.map((g) => (
+                    <option key={`group:${g.name}`} value={g.name}>
+                      {g.name}
+                    </option>
+                  ))}
+                </optgroup>
+              </select>
+            </label>
+          )}
         </Panel>
       )}
 
@@ -164,7 +178,10 @@ export default function QueryRunPage() {
                 {runError.message}
               </Alert>
             )}
-            <Button variant="primary" onClick={handleRun} disabled={running}>
+            {!selectedRole && (
+              <p className="text-xs text-slate-500">Pick a role or group above to run the query.</p>
+            )}
+            <Button variant="primary" onClick={handleRun} disabled={running || !selectedRole}>
               {running ? 'Running…' : 'Run query'}
             </Button>
 

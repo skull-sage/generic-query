@@ -8,6 +8,8 @@ import YamlEditor from '../components/YamlEditor.jsx'
 import ParamsForm from '../components/ParamsForm.jsx'
 import ResultsTable from '../components/ResultsTable.jsx'
 import MetricsStrip from '../components/MetricsStrip.jsx'
+import Modal from '../components/Modal.jsx'
+import RolePicker from '../components/RolePicker.jsx'
 import { DEFAULT_DRAFT_YAML, validatedQueryToYaml, yamlToDraftEntry } from '../api/yaml.js'
 import { discardDraft, draftQuery, getDrafted, publishQuery, simulateQuery } from '../api/engineClient.js'
 
@@ -34,6 +36,8 @@ export default function QueryBuilderPage() {
   const [publishResult, setPublishResult] = useState(null)
   const [publishError, setPublishError] = useState(null)
   const [publishing, setPublishing] = useState(false)
+  const [showPublishModal, setShowPublishModal] = useState(false)
+  const [selectedRoles, setSelectedRoles] = useState([])
 
   // Resume an existing draft when navigated here from the Query List ("Edit draft").
   useEffect(() => {
@@ -99,13 +103,20 @@ export default function QueryBuilderPage() {
     }
   }
 
+  function openPublishModal() {
+    setPublishError(null)
+    setSelectedRoles([])
+    setShowPublishModal(true)
+  }
+
   async function handlePublish() {
-    if (!draft) return
+    if (!draft || selectedRoles.length === 0) return
     setPublishing(true)
     setPublishError(null)
     try {
-      const result = await publishQuery(draft.queryName, AUTHOR)
+      const result = await publishQuery(draft.queryName, AUTHOR, selectedRoles)
       setPublishResult(result)
+      setShowPublishModal(false)
     } catch (err) {
       setPublishError(err)
     } finally {
@@ -128,6 +139,8 @@ export default function QueryBuilderPage() {
     setSimulateError(null)
     setPublishResult(null)
     setPublishError(null)
+    setShowPublishModal(false)
+    setSelectedRoles([])
     navigate('/builder', { replace: true })
   }
 
@@ -146,7 +159,7 @@ export default function QueryBuilderPage() {
 
       <Panel
         title="1. Draft"
-        description="Write the query entry as YAML: queryName, sql, params, allowed_roles."
+        description="Write the query entry as YAML: queryName, sql, params. Allowed roles are chosen when you publish."
         actions={draft && <StatusBadge status={draft.status} />}
       >
         <div className="space-y-4">
@@ -216,7 +229,7 @@ export default function QueryBuilderPage() {
 
       <Panel
         title="3. Publish"
-        description="Make this query callable by client apps via POST /data-query, with the allowed_roles declared in step 1."
+        description="Make this query callable by client apps via POST /data-query. You'll choose which realm roles and groups may invoke it when you publish."
       >
         {!canPublish ? (
           <p className="text-sm text-slate-500">Run a successful simulation above before publishing.</p>
@@ -227,20 +240,50 @@ export default function QueryBuilderPage() {
           </Alert>
         ) : (
           <div className="space-y-4">
-            <div className="flex items-center gap-2 flex-wrap text-xs text-slate-500">
-              <span>allowed roles: <span className="font-mono">{draft?.validatedQuery?.allowedRoles?.join(', ') || '—'}</span></span>
-            </div>
+            <p className="text-sm text-slate-500">
+              Choose the realm roles and groups allowed to call this query, then publish.
+            </p>
+            {publishError && !showPublishModal && (
+              <Alert variant="error" title={publishError.code || 'Publish failed'}>
+                {publishError.message}
+              </Alert>
+            )}
+            <Button variant="success" onClick={openPublishModal}>
+              Publish query…
+            </Button>
+          </div>
+        )}
+      </Panel>
+
+      {showPublishModal && (
+        <Modal
+          title="Publish query"
+          description="Select the realm roles and groups allowed to invoke this query."
+          onClose={() => !publishing && setShowPublishModal(false)}
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setShowPublishModal(false)} disabled={publishing}>
+                Cancel
+              </Button>
+              <Button variant="success" onClick={handlePublish} disabled={publishing || selectedRoles.length === 0}>
+                {publishing ? 'Publishing…' : `Publish${selectedRoles.length ? ` (${selectedRoles.length})` : ''}`}
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-4">
             {publishError && (
               <Alert variant="error" title={publishError.code || 'Publish failed'}>
                 {publishError.message}
               </Alert>
             )}
-            <Button variant="success" onClick={handlePublish} disabled={publishing}>
-              {publishing ? 'Publishing…' : 'Publish query'}
-            </Button>
+            <RolePicker value={selectedRoles} onChange={setSelectedRoles} />
+            {selectedRoles.length === 0 && (
+              <p className="text-xs text-slate-500">Select at least one role or group to enable publishing.</p>
+            )}
           </div>
-        )}
-      </Panel>
+        </Modal>
+      )}
     </div>
   )
 }

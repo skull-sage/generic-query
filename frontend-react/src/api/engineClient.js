@@ -29,7 +29,7 @@ async function request(path, { method = 'POST', body, headers = {} } = {}) {
   return parsed
 }
 
-/** POST /engine/draft -- { queryName, sql, params, allowed_roles } */
+/** POST /engine/draft -- { queryName, sql, params } (allowed_roles are chosen later, at publish) */
 export function draftQuery(entry, author) {
   return request('/engine/draft', { body: entry, headers: { 'X-Author': author } })
 }
@@ -44,9 +44,13 @@ export function simulateQuery(queryName, params) {
   return request('/engine/simulate', { body: { queryName, params } })
 }
 
-/** POST /engine/publish -- { queryName } */
-export function publishQuery(queryName, author) {
-  return request('/engine/publish', { body: { queryName }, headers: { 'X-Author': author } })
+/** POST /engine/publish -- { queryName, allowed_roles }. The allowed roles/groups are chosen in
+ *  the publish dialog, not at draft time. */
+export function publishQuery(queryName, author, allowedRoles) {
+  return request('/engine/publish', {
+    body: { queryName, allowed_roles: allowedRoles },
+    headers: { 'X-Author': author },
+  })
 }
 
 /** POST /engine/discard -- { queryName } */
@@ -62,4 +66,10 @@ export function listQueries(filter, page) {
 /** POST /data-query -- { name, params } */
 export function invokeQuery(name, params, roles) {
   return request('/data-query', { body: { name, params }, headers: { 'X-Roles': roles } })
+}
+
+/** GET /query-roles -- { realmRoles: [{ name, description }], groups: [{ name, path, description }] }.
+ *  The identity catalog the UI offers when choosing allowed roles (publish) or a calling identity (run). */
+export function getQueryRoles() {
+  return request('/query-roles', { method: 'GET' })
 }

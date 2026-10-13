@@ -26,3 +26,38 @@ CREATE TABLE IF NOT EXISTS published_query (
     published_at     TIMESTAMPTZ   NOT NULL,
     published_by     VARCHAR(255)  NOT NULL
 );
+
+-- Identity catalog consulted by the UI when publishing a query (to choose which realm roles and
+-- groups may invoke it) and when running a published query (to pick an identity to call as). In a
+-- real deployment this mirrors the identity provider (e.g. Keycloak realm roles and groups); here
+-- it is a self-contained seeded catalog exposed via GET /query-roles.
+
+CREATE TABLE IF NOT EXISTS realm_role (
+    name         VARCHAR(255) NOT NULL PRIMARY KEY,
+    description  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS realm_group (
+    name         VARCHAR(255) NOT NULL PRIMARY KEY,
+    path         VARCHAR(255) NOT NULL,
+    description  TEXT
+);
+
+INSERT INTO realm_role (name, description) VALUES
+    ('senior_DBA',     'Senior database administrator with broad read access to projections'),
+    ('chief_DBA',      'Lead DBA; may invoke any published query'),
+    ('data_analyst',   'Business/data analyst running reporting queries'),
+    ('branch_manager', 'Branch manager; scoped to their own branch data'),
+    ('auditor',        'Read-only auditor for compliance reviews'),
+    ('ops_engineer',   'Operations/SRE engineer monitoring live data'),
+    ('read_only',      'Generic least-privilege read-only role')
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO realm_group (name, path, description) VALUES
+    ('data-platform',   '/data-platform',             'Data platform engineering team'),
+    ('finance',         '/finance',                   'Finance department'),
+    ('operations',      '/operations',                'Operations and support'),
+    ('audit',           '/audit',                     'Internal audit and compliance'),
+    ('branch-managers', '/branch-managers',           'All branch managers'),
+    ('executives',      '/executives',                'Executive leadership')
+ON CONFLICT (name) DO NOTHING;

@@ -29,7 +29,7 @@ services:
       dockerfile: Dockerfile
     container_name: query-engine-app
     environment:
-      DB_URL: jdbc:postgresql://postgres:5432/generic_query
+      R2DBC_URL: r2dbc:postgresql://postgres:5432/generic_query
       DB_USERNAME: generic_query
       DB_PASSWORD: generic_query
     ports:
