@@ -1,0 +1,40 @@
+name: order-query
+
+# OrderQuery stack: the Order domain's own Postgres projection store plus the OrderQuery service.
+# Fully independent from inventory-query: separate database, network, ports and lifecycle.
+services:
+  postgres:
+    image: postgres:14-alpine
+    container_name: order-query-postgres
+    environment:
+      POSTGRES_DB: order_query
+      POSTGRES_USER: order_query
+      POSTGRES_PASSWORD: order_query
+    ports:
+      - "5433:5432"
+    volumes:
+      # Projection tables only. query-engine creates its own tables when the service starts.
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U order_query -d order_query"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Stopping/starting this container (`docker compose stop|start order-query`) while Postgres keeps
+  # running is the manual check that the service holds no in-memory state.
+  order-query:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: order-query-app
+    environment:
+      SERVER_PORT: "8081"
+      R2DBC_URL: r2dbc:postgresql://postgres:5432/order_query
+      DB_USERNAME: order_query
+      DB_PASSWORD: order_query
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy

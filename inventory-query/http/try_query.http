@@ -1,0 +1,57 @@
+### InventoryQuery — Phase 2, Query Invocation (run-time)
+### Calls published Inventory queries the way an independent client app would.
+### Prereqs: inventory-query is running (./dry-run.sh) and publish_query.http has been run, so
+### inventory.stockByWarehouseAndStatus is published to ["warehouse_manager", "supply-chain"]
+### and inventory.needsRestockByCategory to ["supply-chain", "data_analyst"].
+
+@baseUrl = http://localhost:8082
+
+### Stock lines in Chittagong that are running low.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: warehouse_manager
+
+{
+  "name": "inventory.stockByWarehouseAndStatus",
+  "params": { "warehouseId": "WH-CTG", "status": "LOW_STOCK" }
+}
+
+### Backordered lines in Khulna, calling as a group.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: supply-chain
+
+{
+  "name": "inventory.stockByWarehouseAndStatus",
+  "params": { "warehouseId": "WH-KHL", "status": "BACKORDERED" }
+}
+
+### Everything at or below reorder level in PHARMA, by bare query name.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: data_analyst
+
+{
+  "name": "needsRestockByCategory",
+  "params": { "category": "PHARMA" }
+}
+
+### 403 FORBIDDEN — data_analyst isn't allowed to call the warehouse query.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: data_analyst
+
+{
+  "name": "inventory.stockByWarehouseAndStatus",
+  "params": { "warehouseId": "WH-DHK", "status": "IN_STOCK" }
+}
+
+### 404 QUERY_NOT_FOUND — Order queries live in order-query, not here.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: senior_DBA
+
+{
+  "name": "orders.ordersByStatusAndBranch",
+  "params": { "status": "SHIPPED", "branchId": 12 }
+}

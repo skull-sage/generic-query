@@ -1,8 +1,8 @@
-# dry-run.sh artifacts (query_engine itself now runs containerized, see docker-compose.yml)
+# dry-run.sh artifacts (the Query Builder UI dev server's pid and log)
 .dry-run-frontend.log
 .dry-run-frontend.pid
 
-# build output (each service also has its own .gitignore for Gradle specifics)
+# build output (each project also has its own .gitignore for tool specifics)
 **/build/
 **/.gradle/
 **/bin/

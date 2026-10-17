@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
 # stop.sh — tears down everything dry-run.sh started:
-#   1. Stops the backgrounded frontend-react dev server (if running).
-#   2. Stops and removes the dockerized query_engine and Postgres containers
-#      (docker compose down).
+#   1. Stops the Query Builder UI dev server: the one dry-run.sh started (its whole process
+#      group) plus any other dev server of this UI still running, e.g. one started by hand with
+#      `npm run dev` or left over from an earlier run. Other projects' processes aren't touched.
+#      See scripts/ui-dev-server.sh.
+#   2. Stops and removes each domain's docker compose stack (service + Postgres) along with its
+#      database volume, so the next ./dry-run.sh starts from freshly seeded data.
 #
-# Safe to run even if nothing is up -- each step is a no-op if there's nothing to stop.
+# Safe to run when nothing is up -- every step is a no-op then.
 #
 # Usage:
 #   ./stop.sh
@@ -13,36 +16,37 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 WORKSPACE_DIR="$(pwd)"
-COMPOSE_FILE="${WORKSPACE_DIR}/docker/docker-compose.yml"
-FRONTEND_LOG="${WORKSPACE_DIR}/.dry-run-frontend.log"
-FRONTEND_PID_FILE="${WORKSPACE_DIR}/.dry-run-frontend.pid"
+UI_DIR="${WORKSPACE_DIR}/query-builder-ui"
+UI_PORT=5173
+UI_LOG="${WORKSPACE_DIR}/.dry-run-frontend.log"
+UI_PID_FILE="${WORKSPACE_DIR}/.dry-run-frontend.pid"
+# shellcheck source=scripts/ui-dev-server.sh
+source "${WORKSPACE_DIR}/scripts/ui-dev-server.sh"
 
 echo "==> Workspace: ${WORKSPACE_DIR}"
 
-stop_pid_file() {
-  local name="$1" pid_file="$2" log_file="$3"
-  if [[ -f "${pid_file}" ]]; then
-    local pid
-    pid="$(cat "${pid_file}")"
-    if kill -0 "${pid}" 2>/dev/null; then
-      echo "==> Stopping ${name} (pid ${pid}) ..."
-      kill "${pid}" 2>/dev/null || true
-      wait "${pid}" 2>/dev/null || true
-    else
-      echo "==> ${name} pid file found but process ${pid} isn't running."
-    fi
-    rm -f "${pid_file}"
-  else
-    echo "==> No ${name} pid file -- nothing to stop."
-  fi
-  rm -f "${log_file}"
-}
+# ---- 1. stop the UI ----
+ui_stop_all
+rm -f "${UI_LOG}"
 
-# ---- 1. stop frontend-react ----
-stop_pid_file "frontend-react" "${FRONTEND_PID_FILE}" "${FRONTEND_LOG}"
+remaining="$(ui_find_ours)"
+if [[ -n "${remaining}" ]]; then
+  echo "WARNING: these query-builder-ui processes are still running:" >&2
+  for pid in ${remaining}; do ps -o pid=,command= -p "${pid}" >&2 || true; done
+fi
 
-# ---- 2. stop and remove the query_engine and Postgres containers ----
-echo "==> Stopping query_engine and Postgres containers ..."
-docker compose -f "${COMPOSE_FILE}" down
+# ---- 2. stop each domain stack ----
+if ! docker info >/dev/null 2>&1; then
+  echo "==> Docker isn't running -- no containers to stop."
+  exit 0
+fi
+
+for service in order-query inventory-query; do
+  echo "==> Stopping ${service} stack ..."
+  docker compose -f "${WORKSPACE_DIR}/${service}/docker/docker-compose.yml" down -v --remove-orphans
+done
+
+# Containers from the old single-service layout (one shared query_engine), if any are left over.
+docker rm -f -v query-engine-app query-engine-postgres >/dev/null 2>&1 || true
 
 echo "==> Done. Everything stopped and removed."

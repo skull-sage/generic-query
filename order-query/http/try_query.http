@@ -1,0 +1,78 @@
+### OrderQuery — Phase 2, Query Invocation (run-time)
+### Calls a published Order query the way an independent client app would.
+### Prereqs: order-query is running (./dry-run.sh) and orders.ordersByStatusAndBranch has been
+### published with allowed_roles ["senior_DBA", "data-platform"] (run publish_query.http first,
+### or publish it from the Query Builder UI).
+
+@baseUrl = http://localhost:8081
+
+### Invoke the published query by its namespaced name, with a role allowed to call it.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: senior_DBA
+
+{
+  "name": "orders.ordersByStatusAndBranch",
+  "params": {
+    "status": "SHIPPED",
+    "branchId": 12
+  }
+}
+
+### Same call by bare name (an unambiguous short name also resolves), calling as a group that
+### is in allowed_roles.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: data-platform
+
+{
+  "name": "ordersByStatusAndBranch",
+  "params": {
+    "status": "QUEUED",
+    "branchId": 12
+  }
+}
+
+### 403 FORBIDDEN — chief_DBA exists in the catalog but isn't in this query's allowed_roles.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: chief_DBA
+
+{
+  "name": "orders.ordersByStatusAndBranch",
+  "params": {
+    "status": "SHIPPED",
+    "branchId": 12
+  }
+}
+
+### 400 INVALID_ARGUMENT — missing a required param.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: senior_DBA
+
+{
+  "name": "orders.ordersByStatusAndBranch",
+  "params": {
+    "status": "SHIPPED"
+  }
+}
+
+### 404 QUERY_NOT_FOUND — nothing published under this name.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: senior_DBA
+
+{
+  "name": "orders.doesNotExist",
+  "params": {
+    "status": "SHIPPED",
+    "branchId": 12
+  }
+}
+
+### Sanity check: list published/drafted Order queries to see what's available to call.
+POST {{baseUrl}}/engine/list
+Content-Type: application/json
+
+{}

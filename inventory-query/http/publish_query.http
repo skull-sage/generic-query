@@ -1,0 +1,121 @@
+### InventoryQuery — Phase 1, Query Definition & Simulation (design-time)
+### Drafts, simulates and publishes a query against the Inventory domain's projection store.
+### Same lifecycle as order-query (both embed query-engine); only the data and the port differ.
+###
+### Prereqs: inventory-query is running (./dry-run.sh, or ./gradlew :inventory-query:bootRun)
+### against a fresh database (./stop.sh then ./dry-run.sh resets it).
+###
+### Run requests TOP TO BOTTOM in a single pass — later ones depend on state left by earlier ones.
+
+@baseUrl = http://localhost:8082
+@queryName = inventory.stockByWarehouseAndStatus
+@author = warehouse_lead@bracits.com
+
+### 0. Identity catalog offered at publish time (allowed_roles) and run time (calling identity).
+GET {{baseUrl}}/query-roles
+
+### 1. Draft — stock lines in one warehouse with a given status.
+POST {{baseUrl}}/engine/draft
+Content-Type: application/json
+X-Author: {{author}}
+
+{
+  "queryName": "{{queryName}}",
+  "sql": "SELECT sku, product_name, category, quantity_on_hand, reorder_level, status FROM inventory_projection WHERE warehouse_id = :warehouseId AND status = :status ORDER BY sku",
+  "params": { "warehouseId": "String", "status": "String" }
+}
+
+### 1b. Draft (YAML) — a second query: items at or below their reorder level in a category.
+### quantity_on_hand <= reorder_level compares two columns; :category is the only bound param.
+POST {{baseUrl}}/engine/draft-yml
+Content-Type: application/yaml
+X-Author: {{author}}
+
+queryName: inventory.needsRestockByCategory
+sql: "SELECT sku, warehouse_id, product_name, quantity_on_hand, reorder_level, status FROM inventory_projection WHERE category = :category AND quantity_on_hand <= reorder_level AND status <> 'DISCONTINUED' ORDER BY quantity_on_hand"
+params:
+  category: String
+
+### 1c. Draft with a param validation error — :minQty is used in sql but not declared.
+### Stored as status=DRAFT; it can't be simulated until re-drafted.
+POST {{baseUrl}}/engine/draft
+Content-Type: application/json
+X-Author: {{author}}
+
+{
+  "queryName": "inventory.aboveQuantity",
+  "sql": "SELECT sku, warehouse_id, quantity_on_hand FROM inventory_projection WHERE quantity_on_hand > :minQty",
+  "params": {}
+}
+
+### 2. Simulate — 400 INVALID_ARGUMENT, wrong type for status (int instead of String).
+POST {{baseUrl}}/engine/simulate
+Content-Type: application/json
+
+{
+  "queryName": "{{queryName}}",
+  "params": { "warehouseId": "WH-DHK", "status": 5 }
+}
+
+### 3. Simulate — happy path. WH-DHK has IN_STOCK, OUT_OF_STOCK, BACKORDERED and DISCONTINUED
+### rows, so try other statuses too.
+POST {{baseUrl}}/engine/simulate
+Content-Type: application/json
+
+{
+  "queryName": "{{queryName}}",
+  "params": { "warehouseId": "WH-DHK", "status": "IN_STOCK" }
+}
+
+### 3b. Simulate the YAML-drafted query.
+POST {{baseUrl}}/engine/simulate
+Content-Type: application/json
+
+{
+  "queryName": "inventory.needsRestockByCategory",
+  "params": { "category": "ELECTRONICS" }
+}
+
+### 4. Publish — 422 NO_ALLOWED_ROLES when no roles/groups are selected.
+POST {{baseUrl}}/engine/publish
+Content-Type: application/json
+X-Author: {{author}}
+
+{
+  "queryName": "{{queryName}}",
+  "allowed_roles": []
+}
+
+### 5. Publish — happy path, callable by a realm role and a group.
+POST {{baseUrl}}/engine/publish
+Content-Type: application/json
+X-Author: {{author}}
+
+{
+  "queryName": "{{queryName}}",
+  "allowed_roles": ["warehouse_manager", "supply-chain"]
+}
+
+### 5b. Publish the YAML-drafted query.
+POST {{baseUrl}}/engine/publish
+Content-Type: application/json
+X-Author: {{author}}
+
+{
+  "queryName": "inventory.needsRestockByCategory",
+  "allowed_roles": ["supply-chain", "data_analyst"]
+}
+
+### 6. Discard the never-valid draft from step 1c.
+POST {{baseUrl}}/engine/discard
+Content-Type: application/json
+
+{
+  "queryName": "inventory.aboveQuantity"
+}
+
+### 7. List everything in the Inventory domain.
+POST {{baseUrl}}/engine/list
+Content-Type: application/json
+
+{}

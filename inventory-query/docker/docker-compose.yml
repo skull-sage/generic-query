@@ -1,0 +1,41 @@
+name: inventory-query
+
+# InventoryQuery stack: the Inventory domain's own Postgres projection store plus the
+# InventoryQuery service. Fully independent from order-query: separate database, network, ports
+# and lifecycle.
+services:
+  postgres:
+    image: postgres:14-alpine
+    container_name: inventory-query-postgres
+    environment:
+      POSTGRES_DB: inventory_query
+      POSTGRES_USER: inventory_query
+      POSTGRES_PASSWORD: inventory_query
+    ports:
+      - "5434:5432"
+    volumes:
+      # Projection tables only. query-engine creates its own tables when the service starts.
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory_query -d inventory_query"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Stopping/starting this container (`docker compose stop|start inventory-query`) while Postgres
+  # keeps running is the manual check that the service holds no in-memory state.
+  inventory-query:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: inventory-query-app
+    environment:
+      SERVER_PORT: "8082"
+      R2DBC_URL: r2dbc:postgresql://postgres:5432/inventory_query
+      DB_USERNAME: inventory_query
+      DB_PASSWORD: inventory_query
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy

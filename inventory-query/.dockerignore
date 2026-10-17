@@ -1,0 +1,3 @@
+# The image only needs the boot jar built on the host.
+*
+!build/libs/inventory-query-*.jar
